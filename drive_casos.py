@@ -58,12 +58,19 @@ def _slug(s: str) -> str:
     return ("".join(keep).strip().replace(" ", "_")) or "x"
 
 
+_LIMITE_RESUMABLE = 8 * 1024 * 1024  # 8 MB: por debajo subimos en 1 sola request
+
+
 def _intentar_subida(file_bytes: bytes, nombre: str, mimetype):
     svc = oauth_creds.get_drive_service()
+    # Para archivos chicos (la mayoría: telegramas, fotos, PDFs) usamos subida
+    # DIRECTA (1 sola request) en vez de "resumable", que agrega 1-2 vueltas extra
+    # a Google. Solo los archivos grandes usan resumable (más robusto en cortes).
+    grande = len(file_bytes) > _LIMITE_RESUMABLE
     media = MediaIoBaseUpload(
         io.BytesIO(file_bytes),
         mimetype=mimetype or "application/octet-stream",
-        resumable=True,
+        resumable=grande,
         chunksize=5 * 1024 * 1024,
     )
     body = {"name": nombre}
@@ -71,9 +78,12 @@ def _intentar_subida(file_bytes: bytes, nombre: str, mimetype):
     if fid:
         body["parents"] = [fid]
     req = svc.files().create(body=body, media_body=media, fields="id, webViewLink")
-    archivo = None
-    while archivo is None:
-        _status, archivo = req.next_chunk(num_retries=3)
+    if grande:
+        archivo = None
+        while archivo is None:
+            _status, archivo = req.next_chunk(num_retries=3)
+    else:
+        archivo = req.execute(num_retries=3)
     svc.permissions().create(
         fileId=archivo["id"],
         body={"type": "anyone", "role": "reader"},

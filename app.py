@@ -63,9 +63,18 @@ if not _check_password():
 
 # ----- Helpers de datos -------------------------------------------------------
 
-def _refrescar():
+def _refrescar(*cuales):
+    """Invalida el cache. Sin argumentos: todo. Con argumentos (subconjunto de
+    'casos'/'agenda'/'adjuntos'): recarga SOLO esas tablas de Google y mantiene
+    las demás en cache → cada acción hace 1 sola lectura en vez de 3."""
     db.invalidar_cache()
-    st.cache_data.clear()
+    if not cuales:
+        st.cache_data.clear()
+        return
+    mapa = {"casos": cargar_casos, "agenda": cargar_agenda, "adjuntos": cargar_adjuntos}
+    for c in cuales:
+        if c in mapa:
+            mapa[c].clear()
 
 
 def _limpiar_keys(prefijo: str):
@@ -360,7 +369,7 @@ elif seccion == "➕ Nuevo caso":
             caso = {"rubro": rubro, "area": area, **valores}
             with st.spinner("⏳ Creando el caso… (guardando en la planilla)"):
                 cid = db.append_caso(caso)
-            _refrescar()
+            _refrescar("casos")
             _limpiar_keys(f"nc_{rubro}_{area}_")  # resetear el form para la próxima carga
             st.session_state["caso_sel"] = cid
             st.session_state["toast_msg"] = "Caso creado correctamente"
@@ -421,7 +430,7 @@ elif seccion == "🔎 Ver / editar caso":
             else:
                 with st.spinner("⏳ Guardando cambios… (actualizando la planilla)"):
                     db.actualizar_caso(caso["id"], valores)
-                _refrescar()
+                _refrescar("casos")
                 st.session_state["toast_msg"] = "Cambios guardados"
                 st.session_state["vc_ok"] = "Cambios guardados ✅"
                 st.rerun()
@@ -445,19 +454,19 @@ elif seccion == "🔎 Ver / editar caso":
                     if not cumplido and st.button("✔️ Cumplido", key=f"cmp_{e['id']}"):
                         with st.spinner("⏳ Marcando cumplido…"):
                             db.marcar_evento_cumplido(e["id"], True)
-                        _refrescar()
+                        _refrescar("agenda")
                         st.session_state["toast_msg"] = "Evento marcado como cumplido"
                         st.rerun()
                     if cumplido and st.button("↩️ Reabrir", key=f"reab_{e['id']}"):
                         with st.spinner("⏳ Reabriendo…"):
                             db.marcar_evento_cumplido(e["id"], False)
-                        _refrescar()
+                        _refrescar("agenda")
                         st.session_state["toast_msg"] = "Evento reabierto"
                         st.rerun()
                     if st.button("🗑️", key=f"delev_{e['id']}"):
                         with st.spinner("⏳ Borrando evento…"):
                             _baja_evento(e)
-                        _refrescar()
+                        _refrescar("agenda")
                         st.session_state["toast_msg"] = "Evento borrado"
                         st.rerun()
 
@@ -478,7 +487,7 @@ elif seccion == "🔎 Ver / editar caso":
                 with st.spinner("⏳ Agendando el evento y sincronizando con el calendario…"):
                     _alta_evento(caso, ev_tipo, ev_desc.strip(),
                                  cl.fmt_fecha(ev_fecha), int(ev_rec))
-                _refrescar()
+                _refrescar("agenda")
                 _limpiar_keys(f"nev_desc_{caso['id']}")
                 _limpiar_keys(f"nev_fecha_{caso['id']}")
                 via = "Google Calendar" if cal.calendar_disponible() else "la agenda (.ics)"
@@ -502,7 +511,7 @@ elif seccion == "🔎 Ver / editar caso":
                 if cols[3].button("🗑️", key=f"deladj_{a['id']}"):
                     with st.spinner("⏳ Borrando adjunto…"):
                         db.borrar_adjunto(a["id"])
-                    _refrescar()
+                    _refrescar("adjuntos")
                     st.session_state["toast_msg"] = "Adjunto borrado"
                     st.rerun()
 
@@ -548,7 +557,7 @@ elif seccion == "🔎 Ver / editar caso":
                             fallaron.append(f"{f.name}: {e}")
                         prog.progress(i / total, text=f"Subiendo {i}/{total}…")
                     prog.empty()
-                    _refrescar()
+                    _refrescar("adjuntos")
                     _limpiar_keys(f"nad_desc_{caso['id']}")
                     _limpiar_keys(f"nad_fecha_{caso['id']}")
                     _limpiar_keys(f"nad_files_{caso['id']}")
