@@ -15,11 +15,18 @@ enriquecido con 'cliente' para un título más claro.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
+from urllib.parse import quote
+
+import requests
 
 import casos_db
 import casos_logic as cl
 import oauth_creds
+
+_CAL_BASE = "https://www.googleapis.com/calendar/v3/calendars"
+_TIMEOUT = (10, 60)  # (conexión, lectura) en segundos
 
 
 # ----- Config -----------------------------------------------------------------
@@ -77,8 +84,9 @@ def upsert_evento_calendar(evento: dict) -> str:
     if fecha is None:
         return ""  # sin fecha no hay evento de calendario
 
-    svc = oauth_creds.get_calendar_service()
-    cal_id = _calendar_id()
+    sess = oauth_creds.get_session()
+    headers = {**oauth_creds.auth_header(), "Content-Type": "application/json"}
+    base = f"{_CAL_BASE}/{quote(_calendar_id(), safe='')}/events"
     minutos = _minutos_antes(evento)
     body = {
         "summary": _titulo(evento),
@@ -94,16 +102,20 @@ def upsert_evento_calendar(evento: dict) -> str:
             ],
         },
     }
-    gid = (evento.get("gcal_event_id") or "").strip()
-    if gid:
-        try:
-            res = svc.events().update(
-                calendarId=cal_id, eventId=gid, body=body).execute()
-            return res.get("id", gid)
-        except Exception:
-            pass  # el evento pudo haberse borrado a mano: lo recreamos
-    res = svc.events().insert(calendarId=cal_id, body=body).execute()
-    return res.get("id", "")
+    payload = json.dumps(body)
+    try:
+        gid = (evento.get("gcal_event_id") or "").strip()
+        if gid:
+            r = sess.put(f"{base}/{gid}", headers=headers, data=payload, timeout=_TIMEOUT)
+            if r.status_code == 200:
+                return r.json().get("id", gid)
+            # 404/410: se borró a mano → caemos a crear uno nuevo
+        r = sess.post(base, headers=headers, data=payload, timeout=_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get("id", "")
+    except requests.RequestException:
+        oauth_creds.reset()
+        return ""
 
 
 def borrar_evento_calendar(gcal_event_id: str) -> bool:
@@ -112,10 +124,11 @@ def borrar_evento_calendar(gcal_event_id: str) -> bool:
     if not gid or not calendar_disponible():
         return False
     try:
-        oauth_creds.get_calendar_service().events().delete(
-            calendarId=_calendar_id(), eventId=gid).execute()
-        return True
-    except Exception:
+        url = f"{_CAL_BASE}/{quote(_calendar_id(), safe='')}/events/{gid}"
+        r = oauth_creds.get_session().delete(
+            url, headers=oauth_creds.auth_header(), timeout=_TIMEOUT)
+        return r.status_code in (200, 204, 404, 410)  # 404/410 = ya no existe
+    except requests.RequestException:
         return False
 
 

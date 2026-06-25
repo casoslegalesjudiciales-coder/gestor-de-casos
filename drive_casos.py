@@ -1,22 +1,22 @@
 """drive_casos.py — Subida de adjuntos a Google Drive (vía OAuth del estudio).
 
-A diferencia del template de facturas (que usaba la cuenta de servicio + Unidad
-Compartida), acá subimos actuando COMO la cuenta del estudio (oauth_creds), porque
-en Gmail gratis la SA no tiene cuota ni hay Unidades Compartidas. Los archivos
+Subimos actuando COMO la cuenta del estudio (oauth_creds), porque en Gmail gratis
+la cuenta de servicio no tiene cuota ni hay Unidades Compartidas. Los archivos
 quedan en el Drive del estudio (15 GB) y se comparten "cualquiera con el link
 puede ver" para poder mostrarlos en la app.
 
-Destino opcional: una carpeta normal del Drive del estudio cuyo ID se ponga en
-`drive_folder_id` (secrets) / DRIVE_FOLDER_ID (.env). Si no se define, van a la
-raíz de "Mi unidad".
+PERFORMANCE: usamos HTTP directo con `requests` (sesión persistente de oauth_creds)
+en vez de googleapiclient/httplib2, que se colgaba/relentizaba con OAuth. Una
+subida chica = 1 request (multipart) + 1 request (permiso). Destino opcional:
+carpeta `drive_folder_id` (secrets) / DRIVE_FOLDER_ID (.env); si no, raíz de Mi unidad.
 """
 
 from __future__ import annotations
 
-import io
+import json
 import threading
 
-from googleapiclient.http import MediaIoBaseUpload
+import requests
 
 import casos_db
 import oauth_creds
@@ -25,10 +25,11 @@ _lock = threading.Lock()
 _folder_id_cache = None
 _FOLDER_SENTINEL = object()
 
-_ERRORES_RED = (
-    BrokenPipeError, ConnectionError, ConnectionResetError,
-    ConnectionAbortedError, TimeoutError, OSError,
-)
+_UPLOAD_URL = ("https://www.googleapis.com/upload/drive/v3/files"
+               "?uploadType=multipart&fields=id,webViewLink&supportsAllDrives=true")
+_PERM_URL = "https://www.googleapis.com/drive/v3/files/{fid}/permissions?supportsAllDrives=true"
+
+_TIMEOUT = (10, 120)  # (conexión, lectura) en segundos
 
 
 def _folder_id():
@@ -58,37 +59,46 @@ def _slug(s: str) -> str:
     return ("".join(keep).strip().replace(" ", "_")) or "x"
 
 
-_LIMITE_RESUMABLE = 8 * 1024 * 1024  # 8 MB: por debajo subimos en 1 sola request
+def _intentar_subida(file_bytes: bytes, nombre: str, mimetype) -> dict:
+    """Sube el archivo (multipart) y lo comparte 'anyone:reader'. Devuelve el JSON."""
+    sess = oauth_creds.get_session()
+    token = oauth_creds.get_access_token()
+    mimetype = mimetype or "application/octet-stream"
 
-
-def _intentar_subida(file_bytes: bytes, nombre: str, mimetype):
-    svc = oauth_creds.get_drive_service()
-    # Para archivos chicos (la mayoría: telegramas, fotos, PDFs) usamos subida
-    # DIRECTA (1 sola request) en vez de "resumable", que agrega 1-2 vueltas extra
-    # a Google. Solo los archivos grandes usan resumable (más robusto en cortes).
-    grande = len(file_bytes) > _LIMITE_RESUMABLE
-    media = MediaIoBaseUpload(
-        io.BytesIO(file_bytes),
-        mimetype=mimetype or "application/octet-stream",
-        resumable=grande,
-        chunksize=5 * 1024 * 1024,
-    )
-    body = {"name": nombre}
+    metadata = {"name": nombre}
     fid = _folder_id()
     if fid:
-        body["parents"] = [fid]
-    req = svc.files().create(body=body, media_body=media, fields="id, webViewLink")
-    if grande:
-        archivo = None
-        while archivo is None:
-            _status, archivo = req.next_chunk(num_retries=3)
-    else:
-        archivo = req.execute(num_retries=3)
-    svc.permissions().create(
-        fileId=archivo["id"],
-        body={"type": "anyone", "role": "reader"},
-        fields="id",
-    ).execute(num_retries=3)
+        metadata["parents"] = [fid]
+
+    # Cuerpo multipart/related: parte 1 = metadata JSON, parte 2 = bytes del archivo.
+    boundary = "===============gestor-casos-boundary=="
+    pre = (
+        f"--{boundary}\r\n"
+        "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        f"{json.dumps(metadata)}\r\n"
+        f"--{boundary}\r\n"
+        f"Content-Type: {mimetype}\r\n\r\n"
+    ).encode("utf-8")
+    post = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    body = pre + file_bytes + post
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": f"multipart/related; boundary={boundary}",
+    }
+    r = sess.post(_UPLOAD_URL, headers=headers, data=body, timeout=_TIMEOUT)
+    r.raise_for_status()
+    archivo = r.json()
+
+    # Compartir: cualquiera con el link puede ver.
+    r2 = sess.post(
+        _PERM_URL.format(fid=archivo["id"]),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+        data=json.dumps({"type": "anyone", "role": "reader"}),
+        timeout=_TIMEOUT,
+    )
+    r2.raise_for_status()
     return archivo
 
 
@@ -96,7 +106,7 @@ def subir_adjunto(file_bytes: bytes, filename: str, mimetype: str | None = None,
                   prefijo: str = "") -> str:
     """Sube un archivo al Drive del estudio y devuelve su link (webViewLink).
 
-    Reintenta reconstruyendo la conexión si se cae (Broken pipe / reset).
+    Reintenta (reseteando credenciales/sesión) si la conexión se cae.
     """
     nombre = f"{_slug(prefijo)}__{filename}" if prefijo else filename
     ultimo_error: Exception | None = None
@@ -106,9 +116,9 @@ def subir_adjunto(file_bytes: bytes, filename: str, mimetype: str | None = None,
                 archivo = _intentar_subida(file_bytes, nombre, mimetype)
             return (archivo.get("webViewLink")
                     or f"https://drive.google.com/file/d/{archivo['id']}/view")
-        except _ERRORES_RED as e:
+        except requests.RequestException as e:
             ultimo_error = e
-            oauth_creds.reset()
+            oauth_creds.reset()  # conexión muerta / token vencido → reconstruir
     raise RuntimeError(
         "No pude subir el archivo a Drive tras varios intentos "
         f"(conexión inestable). Probá de nuevo. Detalle: {ultimo_error}"

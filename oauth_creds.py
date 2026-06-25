@@ -10,16 +10,20 @@ Config (mismas claves en st.secrets o en .env, en mayúsculas):
   oauth_client_secret  / OAUTH_CLIENT_SECRET
   oauth_refresh_token  / OAUTH_REFRESH_TOKEN
 
-Un solo consentimiento cubre ambos scopes. Si falta algo, disponible()=False y la
-app degrada con elegancia (sigue funcionando casos/agenda/semáforo/.ics).
+IMPORTANTE (performance): Drive/Calendar se llaman vía HTTP directo con `requests`
+(sesión persistente con keep-alive), NO con googleapiclient/httplib2 — httplib2 se
+colgaba/relentizaba muchísimo con estas credenciales OAuth. Acá solo resolvemos el
+**access token** (refrescándolo cuando vence) y exponemos una `requests.Session`
+compartida. Si falta config, disponible()=False y la app degrada con elegancia.
 """
 
 from __future__ import annotations
 
 import threading
 
+import requests
 from google.oauth2.credentials import Credentials as UserCredentials
-from googleapiclient.discovery import build
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 import casos_db  # reutilizamos su lector de .env
 
@@ -30,9 +34,9 @@ OAUTH_SCOPES = [
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 _lock = threading.Lock()
+_token_lock = threading.Lock()
 _creds = None
-_drive = None
-_calendar = None
+_session = None
 
 
 def _leer_config():
@@ -63,6 +67,19 @@ def disponible() -> bool:
     return bool(cid and csec and rtok)
 
 
+def get_session() -> requests.Session:
+    """Sesión `requests` compartida (keep-alive: reusa la conexión TLS → rápido)."""
+    global _session
+    if _session is not None:
+        return _session
+    with _lock:
+        if _session is None:
+            s = requests.Session()
+            s.headers.update({"User-Agent": "gestor-casos/1.0"})
+            _session = s
+        return _session
+
+
 def _get_creds():
     global _creds
     if _creds is not None:
@@ -87,30 +104,30 @@ def _get_creds():
         return _creds
 
 
+def get_access_token() -> str:
+    """Devuelve un access token válido (lo refresca solo cuando vence ~1h).
+
+    El refresh usa transporte `requests` sobre la sesión compartida (rápido).
+    """
+    creds = _get_creds()
+    with _token_lock:
+        if not creds.valid:
+            creds.refresh(GoogleAuthRequest(session=get_session()))
+        return creds.token
+
+
+def auth_header() -> dict:
+    return {"Authorization": f"Bearer {get_access_token()}"}
+
+
 def reset():
-    """Descarta credenciales y servicios cacheados (conexión muerta / token rotado)."""
-    global _creds, _drive, _calendar
+    """Descarta credenciales/sesión cacheadas (token rotado / conexión muerta)."""
+    global _creds, _session
     with _lock:
         _creds = None
-        _drive = None
-        _calendar = None
-
-
-def get_drive_service():
-    global _drive
-    if _drive is not None:
-        return _drive
-    with _lock:
-        if _drive is None:
-            _drive = build("drive", "v3", credentials=_get_creds(), cache_discovery=False)
-        return _drive
-
-
-def get_calendar_service():
-    global _calendar
-    if _calendar is not None:
-        return _calendar
-    with _lock:
-        if _calendar is None:
-            _calendar = build("calendar", "v3", credentials=_get_creds(), cache_discovery=False)
-        return _calendar
+        if _session is not None:
+            try:
+                _session.close()
+            except Exception:
+                pass
+        _session = None
