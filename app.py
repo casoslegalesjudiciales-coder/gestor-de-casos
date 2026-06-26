@@ -27,6 +27,7 @@ import casos_db as db
 import casos_logic as cl
 import drive_casos as drive
 import calendar_db as cal
+import docx_export as dx
 
 st.set_page_config(page_title="Gestor de Casos", page_icon="⚖️", layout="wide")
 
@@ -118,6 +119,13 @@ def _label_caso(c: dict) -> str:
     extra = f" · {extra}" if extra else ""
     return (f"{c.get('cliente','(sin cliente)')} — {c.get('rubro','')} · "
             f"{c.get('area','')}{extra}  [{c['id']}]")
+
+
+def _safe_name(s: str) -> str:
+    """Nombre de archivo seguro (para los .docx que se descargan)."""
+    s = (s or "caso").strip()
+    keep = "".join(c if (c.isalnum() or c in " -_") else "_" for c in s)
+    return keep.strip() or "caso"
 
 
 # ----- Render del formulario schema-driven ------------------------------------
@@ -417,6 +425,14 @@ elif seccion == "🔎 Ver / editar caso":
     st.subheader(f"{caso.get('cliente','')} — {caso.get('rubro','')} · {caso.get('area','')}")
     st.caption(f"id `{caso['id']}`")
 
+    # Legajo: documento Word completo del caso (datos + agenda + adjuntos con links)
+    _leg = dx.legajo_caso(caso, eventos_por_caso.get(caso["id"], []),
+                          adjuntos_por_caso.get(caso["id"], []), hoy)
+    st.download_button(
+        "📄 Descargar legajo (Word)", _leg,
+        file_name=f"Legajo - {_safe_name(caso.get('cliente',''))}.docx",
+        mime=dx.MIME, help="Documento completo del caso para imprimir o pasarle a otro abogado.")
+
     tab_datos, tab_agenda, tab_adj = st.tabs(
         ["📝 Datos del caso", "📅 Agenda del caso", "📎 Telegramas y adjuntos"])
 
@@ -621,8 +637,21 @@ elif seccion == "📅 Agenda":
 # ⬇️ EXPORTAR
 # =============================================================================
 elif seccion == "⬇️ Exportar":
-    st.header("⬇️ Exportar a CSV")
-    st.caption("Descargá la base completa de cada pestaña (formato CSV, abrible en Excel).")
+    st.header("⬇️ Exportar")
+
+    st.subheader("📄 Word")
+    st.caption("Todos los casos en un solo documento Word (cada caso con sus datos, "
+               "su agenda y sus adjuntos). Ideal para imprimir o archivar.")
+    if casos:
+        _word_todo = dx.exportar_todo(casos, eventos_por_caso, adjuntos_por_caso, hoy)
+        st.download_button("📄 Descargar todos los casos (Word)", _word_todo,
+                           file_name="Casos del estudio.docx", mime=dx.MIME)
+    else:
+        st.info("No hay casos para exportar.")
+
+    st.divider()
+    st.subheader("📊 Excel / CSV")
+    st.caption("Para trabajar los datos en una planilla (Excel).")
 
     def _csv(filas, headers):
         df = pd.DataFrame([{k: f.get(k, "") for k in headers} for f in filas])
